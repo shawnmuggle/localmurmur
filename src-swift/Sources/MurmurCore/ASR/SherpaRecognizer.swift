@@ -11,10 +11,12 @@ public class SherpaRecognizer: @unchecked Sendable {
     private let recognizer: OpaquePointer
     private let lock = NSLock()
 
-    // True-silence cutoff on PEAK amplitude (normalized [-1,1]). Speech peaks well
-    // above this; ambient room noise stays below. Lower than a mean-RMS gate so
-    // short, quiet words survive.
-    private static let silencePeakThreshold: Float = 0.05
+    // True-silence cutoff on PEAK amplitude (normalized [-1,1]). Kept low so quiet
+    // speech picked up from a distance still passes; auto-gain then lifts it.
+    private static let silencePeakThreshold: Float = 0.015
+    // Auto-gain target peak and ceiling. gain = min(maxGain, targetPeak / peak).
+    private static let targetPeak: Float = 0.5
+    private static let maxGain: Float = 12.0
 
     // Silence padding added around the utterance before offline decode (16kHz).
     // 0.1s lead + 0.4s tail keeps boundary tokens from being clipped.
@@ -104,7 +106,8 @@ public class SherpaRecognizer: @unchecked Sendable {
 
         // Skip recognition only on true silence/noise (→ hallucination). Use the
         // PEAK amplitude, not mean RMS: a short word surrounded by pre-roll/lead
-        // silence has low mean RMS but a clear peak, and we must not drop it.
+        // silence has low mean RMS but a clear peak, and we must not drop it. The
+        // threshold is low so speech picked up from a distance (quiet) still passes.
         var peak: Float = 0
         for s in samples { let a = abs(s); if a > peak { peak = a } }
         if peak < Self.silencePeakThreshold {
@@ -113,8 +116,14 @@ public class SherpaRecognizer: @unchecked Sendable {
             return
         }
 
+        // Auto-gain (AGC): scale quiet/distant speech up to a target peak so you
+        // don't have to speak right into the mic. Capped to avoid blowing up the
+        // noise floor when there's no real speech.
+        let gain = min(Self.maxGain, Self.targetPeak / peak)
+        let normalized = gain > 1.01 ? samples.map { $0 * gain } : samples
+
         let duration = Double(samples.count) / 16000.0
-        fputs("[SherpaRecognizer] decoding \(String(format: "%.1f", duration))s audio (peak=\(String(format: "%.4f", peak)))...\n", stderr)
+        fputs("[SherpaRecognizer] decoding \(String(format: "%.1f", duration))s audio (peak=\(String(format: "%.4f", peak)), gain=\(String(format: "%.1f", gain)))...\n", stderr)
 
         // Pad the utterance with silence on both ends before decoding. SenseVoice's
         // fbank front-end + CTC tail can drop the first/last token when speech starts
@@ -122,7 +131,7 @@ public class SherpaRecognizer: @unchecked Sendable {
         // tokens emit cleanly. Padding is silence, so it never adds spurious words.
         let leadSilence = [Float](repeating: 0, count: Self.leadPadSamples)
         let tailSilence = [Float](repeating: 0, count: Self.tailPadSamples)
-        let paddedSamples = leadSilence + samples + tailSilence
+        let paddedSamples = leadSilence + normalized + tailSilence
 
         // Run offline decode on a background thread to avoid blocking the caller.
         // Dispatch callbacks back to main thread to avoid data races on closure properties.
