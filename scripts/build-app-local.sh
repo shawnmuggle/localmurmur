@@ -36,8 +36,13 @@ cp "$BINARY"               "$APP_BUNDLE/Contents/MacOS/murmur"
 cp "$SWIFT_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 cp "$SWIFT_DIR/murmur.icns" "$APP_BUNDLE/Contents/Resources/murmur.icns"
 
-# SPM resource bundle (tray icons / localizations) — must sit next to the binary
+# SPM resource bundle (tray icons / localizations). Placed in code-sign-safe
+# locations under Contents/ and resolved at runtime by Bundle.appResources
+# (see Localization.swift) — NOT at the .app root, which would break signing.
+#   - Contents/Resources/ : primary lookup for Bundle.appResources
+#   - Contents/MacOS/      : the tray-icon loader looks next to the executable
 if [ -d "$BUILD_DIR/murmur_murmur.bundle" ]; then
+    cp -R "$BUILD_DIR/murmur_murmur.bundle" "$APP_BUNDLE/Contents/Resources/"
     cp -R "$BUILD_DIR/murmur_murmur.bundle" "$APP_BUNDLE/Contents/MacOS/"
 fi
 
@@ -64,8 +69,10 @@ SIGN_ID=$(security find-identity 2>/dev/null | grep "Murmur Local Signing" | gre
 SIGN_ID="${SIGN_ID:--}"
 echo "[3/4] Signing with: $SIGN_ID"
 ENTITLEMENTS="$SWIFT_DIR/murmur.entitlements"
-RES_BUNDLE="$APP_BUNDLE/Contents/MacOS/murmur_murmur.bundle"
-[ -d "$RES_BUNDLE" ] && codesign --force --sign "$SIGN_ID" "$RES_BUNDLE"
+# Sign both copies of the resource bundle before sealing the app.
+for RES_BUNDLE in "$APP_BUNDLE/Contents/Resources/murmur_murmur.bundle" "$APP_BUNDLE/Contents/MacOS/murmur_murmur.bundle"; do
+    [ -d "$RES_BUNDLE" ] && codesign --force --sign "$SIGN_ID" "$RES_BUNDLE"
+done
 codesign --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP_BUNDLE/Contents/MacOS/murmur"
 codesign --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP_BUNDLE"
 

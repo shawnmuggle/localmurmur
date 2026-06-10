@@ -27,7 +27,7 @@ private func bootstrapLocalization() {
         if let cls = objc_allocateClassPair(base, "_MurmurMainBundle", 0) {
             let imp = imp_implementationWithBlock(
                 { (_: AnyObject, key: String, val: String?, tbl: String?) -> String in
-                    Bundle.module.localizedString(forKey: key, value: val, table: tbl)
+                    Bundle.appResources.localizedString(forKey: key, value: val, table: tbl)
                 } as @convention(block) (AnyObject, String, String?, String?) -> String
             )
             class_addMethod(cls, sel, imp, types)
@@ -40,7 +40,7 @@ private func bootstrapLocalization() {
     let fm = FileManager.default
     // Bundle.module's resource root contains zh-hans.lproj, en.lproj, …
     // .lproj dirs live at the bundle root, not inside resourceURL (Resources/)
-    guard let srcRoot = Bundle.module.resourceURL?.deletingLastPathComponent() else { return }
+    guard let srcRoot = Bundle.appResources.resourceURL?.deletingLastPathComponent() else { return }
     let dstRoot = Bundle.main.bundleURL
 
     let items = (try? fm.contentsOfDirectory(at: srcRoot, includingPropertiesForKeys: nil)) ?? []
