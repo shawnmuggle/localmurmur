@@ -27,5 +27,9 @@ let package = Package(
             dependencies: ["MurmurCore"],
             path: "Tests/MurmurTests"
         ),
-    ]
+    ],
+    // The app's concurrency model targets the Swift 5 language mode; building under
+    // Swift 6 strict concurrency surfaces non-Sendable capture errors
+    // (CFMachPort / OpaquePointer in @Sendable closures). Pin to v5 to match intent.
+    swiftLanguageModes: [.v5]
 )

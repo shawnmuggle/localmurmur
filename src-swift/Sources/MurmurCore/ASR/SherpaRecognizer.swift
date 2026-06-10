@@ -11,20 +11,35 @@ public class SherpaRecognizer: @unchecked Sendable {
     private let recognizer: OpaquePointer
     private let lock = NSLock()
 
-    private static let silenceRmsThreshold: Float = 0.02
+    // True-silence cutoff on PEAK amplitude (normalized [-1,1]). Speech peaks well
+    // above this; ambient room noise stays below. Lower than a mean-RMS gate so
+    // short, quiet words survive.
+    private static let silencePeakThreshold: Float = 0.05
+
+    // Silence padding added around the utterance before offline decode (16kHz).
+    // 0.1s lead + 0.4s tail keeps boundary tokens from being clipped.
+    private static let leadPadSamples = 1600   // 0.1s
+    private static let tailPadSamples = 6400   // 0.4s
 
     // Accumulated Float32 audio for the current session
     private var audioBuffer: [Float] = []
     private var sessionActive = false
 
     public init?(modelDir: String, numThreads: Int = 2) {
-        let modelPath = (modelDir as NSString).appendingPathComponent("model.int8.onnx")
+        // Prefer the full-precision model when present, otherwise the int8 quant.
+        // This makes switching precision a no-code operation: drop model.onnx in to
+        // use fp32, delete it to fall back to model.int8.onnx.
+        let fp32Path = (modelDir as NSString).appendingPathComponent("model.onnx")
+        let int8Path = (modelDir as NSString).appendingPathComponent("model.int8.onnx")
+        let fm = FileManager.default
+        let modelPath = fm.fileExists(atPath: fp32Path) ? fp32Path : int8Path
         let tokensPath = (modelDir as NSString).appendingPathComponent("tokens.txt")
 
-        guard FileManager.default.fileExists(atPath: modelPath) else {
-            fputs("[SherpaRecognizer] model not found: \(modelPath)\n", stderr)
+        guard fm.fileExists(atPath: modelPath) else {
+            fputs("[SherpaRecognizer] model not found in \(modelDir)\n", stderr)
             return nil
         }
+        fputs("[SherpaRecognizer] using model: \((modelPath as NSString).lastPathComponent)\n", stderr)
 
         var config = SherpaOnnxOfflineRecognizerConfig()
         memset(&config, 0, MemoryLayout<SherpaOnnxOfflineRecognizerConfig>.size)
@@ -87,17 +102,27 @@ public class SherpaRecognizer: @unchecked Sendable {
             return
         }
 
-        // Skip recognition if audio is too quiet (silence/noise → hallucination)
-        let sumSq = samples.reduce(0.0) { $0 + Double($1) * Double($1) }
-        let rms = Float(sqrt(sumSq / Double(samples.count)))
-        if rms < Self.silenceRmsThreshold {
-            fputs("[SherpaRecognizer] finishAudio: audio too quiet (rms=\(String(format: "%.4f", rms))), skipping\n", stderr)
+        // Skip recognition only on true silence/noise (→ hallucination). Use the
+        // PEAK amplitude, not mean RMS: a short word surrounded by pre-roll/lead
+        // silence has low mean RMS but a clear peak, and we must not drop it.
+        var peak: Float = 0
+        for s in samples { let a = abs(s); if a > peak { peak = a } }
+        if peak < Self.silencePeakThreshold {
+            fputs("[SherpaRecognizer] finishAudio: audio too quiet (peak=\(String(format: "%.4f", peak))), skipping\n", stderr)
             onResult?(ASRResult(text: "", isFinal: true))
             return
         }
 
         let duration = Double(samples.count) / 16000.0
-        fputs("[SherpaRecognizer] decoding \(String(format: "%.1f", duration))s audio (rms=\(String(format: "%.4f", rms)))...\n", stderr)
+        fputs("[SherpaRecognizer] decoding \(String(format: "%.1f", duration))s audio (peak=\(String(format: "%.4f", peak)))...\n", stderr)
+
+        // Pad the utterance with silence on both ends before decoding. SenseVoice's
+        // fbank front-end + CTC tail can drop the first/last token when speech starts
+        // at sample 0 or ends abruptly; a short silence margin lets the boundary
+        // tokens emit cleanly. Padding is silence, so it never adds spurious words.
+        let leadSilence = [Float](repeating: 0, count: Self.leadPadSamples)
+        let tailSilence = [Float](repeating: 0, count: Self.tailPadSamples)
+        let paddedSamples = leadSilence + samples + tailSilence
 
         // Run offline decode on a background thread to avoid blocking the caller.
         // Dispatch callbacks back to main thread to avoid data races on closure properties.
@@ -110,7 +135,7 @@ public class SherpaRecognizer: @unchecked Sendable {
             }
             defer { SherpaOnnxDestroyOfflineStream(stream) }
 
-            samples.withUnsafeBufferPointer { buf in
+            paddedSamples.withUnsafeBufferPointer { buf in
                 SherpaOnnxAcceptWaveformOffline(stream, 16000, buf.baseAddress, Int32(buf.count))
             }
             SherpaOnnxDecodeOfflineStream(rec, stream)

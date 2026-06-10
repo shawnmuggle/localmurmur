@@ -51,9 +51,14 @@ private func bootstrapLocalization() {
     }
 }
 
-bootstrapLocalization()
+// The process entry point already runs on the main thread (the main actor's
+// executor), so assert that isolation to construct the @MainActor AppDelegate
+// without hopping. assumeIsolated is a no-op assertion here, not a thread hop.
+MainActor.assumeIsolated {
+    bootstrapLocalization()
 
-let app      = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+    let app      = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.run()
+}

@@ -36,6 +36,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var keyboard: KeyboardMonitor!
     private var audio: AudioCapture!
     private var accessibilityRetryTimer: Timer?
+    private var micSleepTimer: Timer?  // releases the warm mic engine after idle
     private let configStore   = ConfigStore()
     private let historyStore  = HistoryStore()
     private let hotwordStore  = HotwordStore()
@@ -57,6 +58,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !granted {
                 fputs("[murmur] microphone permission denied\n", stderr)
             }
+            // The capture engine is started lazily on first PTT press and kept warm
+            // only between presses (idle auto-sleep), so the mic isn't held open the
+            // whole time the app runs. See onPTTStart / onPTTStop.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 self?.setupKeyboard()
             }
@@ -107,17 +111,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             fputs("[AppDelegate] onPTTStart fired\n", stderr)
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                // handleStart first — sets status and shows window immediately
+                // Cancel any pending mic-sleep — we're using it again.
+                self.micSleepTimer?.invalidate()
+                self.micSleepTimer = nil
+
+                // handleStart first (resets the recognizer buffer + shows window),
+                // then begin capture so the flushed pre-roll lands in a fresh session.
                 self.ptt.handleStart()
+
                 let audio = self.audio!
-                let deviceUID = self.configStore.config.microphone
-                // audio.start must run nonisolated (AVAudioEngine installTap
-                // closure inherits caller's actor isolation — crashes if MainActor)
-                Task.detached {
-                    do {
-                        try audio.start(deviceUID: deviceUID)
-                    } catch {
-                        fputs("[murmur] audio.start failed: \(error)\n", stderr)
+                if audio.isRunning {
+                    // Warm engine: pre-roll is available → zero-latency, short clips work.
+                    audio.beginCapture()
+                } else {
+                    // Cold start (first press after idle sleep): spin the engine up,
+                    // then begin. This one press may clip a very short utterance.
+                    let deviceUID = self.configStore.config.microphone
+                    Task.detached {
+                        do { try audio.startEngine(deviceUID: deviceUID) }
+                        catch { fputs("[murmur] audio.startEngine failed: \(error)\n", stderr) }
+                        await MainActor.run { audio.beginCapture() }
                     }
                 }
             }
@@ -126,8 +139,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             fputs("[AppDelegate] onPTTStop fired\n", stderr)
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.audio.stop()
+                // Keep capturing briefly after release so the tail of the last word
+                // isn't clipped, then stop forwarding (engine stays warm for now).
+                try? await Task.sleep(nanoseconds: 180_000_000)  // 0.18s
+                self.audio.endCapture()
                 self.ptt.handleStop()
+
+                // Keep the engine warm for a short while so back-to-back dictation is
+                // instant, then release the mic (orange indicator turns off) for privacy.
+                self.micSleepTimer?.invalidate()
+                self.micSleepTimer = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: false) { [weak self] _ in
+                    guard let self else { return }
+                    fputs("[AppDelegate] mic idle — releasing engine\n", stderr)
+                    self.audio.stopEngine()
+                }
             }
         }
         keyboard.onCursorPosition = { [weak self] point in

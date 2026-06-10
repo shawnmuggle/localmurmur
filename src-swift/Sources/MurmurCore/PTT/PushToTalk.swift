@@ -170,20 +170,23 @@ public class PushToTalk {
 
     /// Returns the path to the model directory bundled with the app.
     nonisolated private static func modelDirectory() -> String {
+        // A directory counts as the model dir if it holds either precision variant.
+        func hasModel(_ dir: String) -> Bool {
+            let fm = FileManager.default
+            return fm.fileExists(atPath: (dir as NSString).appendingPathComponent("model.onnx"))
+                || fm.fileExists(atPath: (dir as NSString).appendingPathComponent("model.int8.onnx"))
+        }
+
         // Release .app bundle: Contents/Resources/models/
         if let resourcePath = Bundle.main.resourcePath {
             let bundled = (resourcePath as NSString).appendingPathComponent("models/sense-voice-zh-en")
-            if FileManager.default.fileExists(atPath: (bundled as NSString).appendingPathComponent("model.int8.onnx")) {
-                return bundled
-            }
+            if hasModel(bundled) { return bundled }
         }
 
         // Development fallback: models/ in the repo root
         let cwd = FileManager.default.currentDirectoryPath as NSString
         let devPath = cwd.appendingPathComponent("models/sense-voice-zh-en")
-        if FileManager.default.fileExists(atPath: (devPath as NSString).appendingPathComponent("model.int8.onnx")) {
-            return devPath
-        }
+        if hasModel(devPath) { return devPath }
 
         // Last resort — should not reach here in normal operation
         fputs("[PushToTalk] WARNING: no model directory found\n", stderr)

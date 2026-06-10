@@ -2,6 +2,19 @@
 import CoreAudio
 import AudioToolbox
 
+/// Microphone capture that keeps the engine **warm** between push-to-talk
+/// sessions. Creating/starting a fresh AVAudioEngine on every key press costs
+/// ~200-300ms of cold-start latency, during which the first (and, for very
+/// short utterances, the *entire*) word is lost. Instead we start the engine
+/// once and keep it running, continuously filling a small pre-roll ring buffer.
+///
+/// While idle, captured audio is only kept in the ring (not forwarded). On
+/// `beginCapture()` we flush the ring — so the moment just *before* the key
+/// press is included — then stream live until `endCapture()`. This makes even
+/// a 0.2s press capture real audio.
+///
+/// Trade-off: the microphone stays active the whole time the engine runs, so
+/// macOS shows the in-use (orange) indicator continuously.
 public class AudioCapture: @unchecked Sendable {
     private var engine: AVAudioEngine?
     private var converter: AVAudioConverter?
@@ -10,6 +23,12 @@ public class AudioCapture: @unchecked Sendable {
     public var onChunk: (@Sendable (Data) -> Void)?
     public var onDeviceName: (@Sendable (String) -> Void)?
     public private(set) var isRunning = false
+
+    private let lock = NSLock()
+    private var capturing = false
+    private var preroll = Data()
+    /// Pre-roll length: 0.3s @ 16kHz mono int16 = 9600 bytes.
+    private static let prerollMaxBytes = 9600
 
     public init() {
         targetFormat = AVAudioFormat(
@@ -20,14 +39,15 @@ public class AudioCapture: @unchecked Sendable {
         )!
     }
 
-    public func start(deviceUID: String? = nil) throws {
+    /// Start the engine and keep it running (warm). Safe to call once at launch.
+    public func startEngine(deviceUID: String? = nil) throws {
         guard !isRunning else { return }
 
-        // Create a fresh engine on every start — AVAudioEngine cannot reliably restart after stop()
+        // A fresh engine — AVAudioEngine cannot reliably restart after stop().
         let eng = AVAudioEngine()
         engine = eng
 
-        // Set specific input device directly on the engine's AudioUnit,
+        // Set a specific input device directly on the engine's AudioUnit,
         // without touching the system-wide default input device.
         if let targetUID = deviceUID, !targetUID.isEmpty,
            let deviceID = findDeviceID(uid: targetUID),
@@ -45,7 +65,6 @@ public class AudioCapture: @unchecked Sendable {
 
         let inputNode = eng.inputNode
         let hwFormat = inputNode.inputFormat(forBus: 0)
-
         converter = AVAudioConverter(from: hwFormat, to: targetFormat)
 
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: hwFormat) { [weak self] buffer, _ in
@@ -60,12 +79,40 @@ public class AudioCapture: @unchecked Sendable {
         DispatchQueue.main.async { cb?(name) }
     }
 
-    public func stop() {
+    /// Tear the engine down completely (e.g. on quit or device switch).
+    public func stopEngine() {
         guard isRunning else { return }
+        lock.lock(); capturing = false; preroll.removeAll(keepingCapacity: false); lock.unlock()
         engine?.inputNode.removeTap(onBus: 0)
         engine?.stop()
         engine = nil
         isRunning = false
+    }
+
+    /// Begin forwarding audio for a PTT session, flushing the pre-roll first so
+    /// the start of speech (and the instant before the press) isn't clipped.
+    public func beginCapture() {
+        lock.lock()
+        let prerollSnapshot = preroll
+        preroll.removeAll(keepingCapacity: true)
+        // Emit the pre-roll, then enable live forwarding — all under the lock so
+        // the next tap callback can't interleave a live chunk ahead of it.
+        if !prerollSnapshot.isEmpty { onChunk?(prerollSnapshot) }
+        capturing = true
+        lock.unlock()
+    }
+
+    /// Stop forwarding audio; the engine stays warm.
+    public func endCapture() {
+        lock.lock()
+        capturing = false
+        lock.unlock()
+    }
+
+    /// Switch input device by restarting the warm engine.
+    public func restartEngine(deviceUID: String?) {
+        stopEngine()
+        try? startEngine(deviceUID: deviceUID)
     }
 
     // MARK: - Private
@@ -95,7 +142,20 @@ public class AudioCapture: @unchecked Sendable {
 
         let byteCount = Int(outBuf.frameLength) * MemoryLayout<Int16>.size
         let data = Data(bytes: int16Data[0], count: byteCount)
-        onChunk?(data)
+
+        lock.lock()
+        if capturing {
+            let cb = onChunk
+            lock.unlock()
+            cb?(data)
+        } else {
+            // Keep only the most recent prerollMaxBytes of audio.
+            preroll.append(data)
+            if preroll.count > Self.prerollMaxBytes {
+                preroll.removeFirst(preroll.count - Self.prerollMaxBytes)
+            }
+            lock.unlock()
+        }
     }
 
     /// Find CoreAudio device ID by UID without side effects.
