@@ -24,6 +24,51 @@ private struct SettingsRoot: View {
     }
 }
 
+private enum MicrophoneFailure: Error {
+    case permissionDenied
+    case permissionRestricted
+    case noInputDevice
+    case selectedDeviceUnavailable
+    case startFailed(String)
+
+    var title: String {
+        switch self {
+        case .permissionDenied, .permissionRestricted:
+            return L("alert.microphone.permission.title")
+        case .noInputDevice:
+            return L("alert.microphone.no_device.title")
+        case .selectedDeviceUnavailable:
+            return L("alert.microphone.selected_unavailable.title")
+        case .startFailed:
+            return L("alert.microphone.start_failed.title")
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .permissionDenied:
+            return L("alert.microphone.permission.message")
+        case .permissionRestricted:
+            return L("alert.microphone.restricted.message")
+        case .noInputDevice:
+            return L("alert.microphone.no_device.message")
+        case .selectedDeviceUnavailable:
+            return L("alert.microphone.selected_unavailable.message")
+        case .startFailed(let detail):
+            return String(format: L("alert.microphone.start_failed.message"), detail)
+        }
+    }
+
+    var canOpenSettings: Bool {
+        switch self {
+        case .permissionDenied, .permissionRestricted:
+            return true
+        case .noInputDevice, .selectedDeviceUnavailable, .startFailed:
+            return false
+        }
+    }
+}
+
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var floatingWindow: FloatingWindow!
@@ -37,6 +82,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var audio: AudioCapture!
     private var accessibilityRetryTimer: Timer?
     private var micSleepTimer: Timer?  // releases the warm mic engine after idle
+    private var microphoneAlertVisible = false
+    private var pttStartInProgress = false
     private let configStore   = ConfigStore()
     private let historyStore  = HistoryStore()
     private let hotwordStore  = HotwordStore()
@@ -57,6 +104,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
             if !granted {
                 fputs("[murmur] microphone permission denied\n", stderr)
+                DispatchQueue.main.async {
+                    self?.showMicrophoneFailureAlert(.permissionDenied)
+                }
             }
             // The capture engine is started lazily on first PTT press and kept warm
             // only between presses (idle auto-sleep), so the mic isn't held open the
@@ -111,28 +161,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             fputs("[AppDelegate] onPTTStart fired\n", stderr)
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                guard !self.pttStartInProgress else { return }
+                self.pttStartInProgress = true
+                defer { self.pttStartInProgress = false }
+
                 // Cancel any pending mic-sleep — we're using it again.
                 self.micSleepTimer?.invalidate()
                 self.micSleepTimer = nil
 
-                // handleStart first (resets the recognizer buffer + shows window),
-                // then begin capture so the flushed pre-roll lands in a fresh session.
-                self.ptt.handleStart()
-
-                let audio = self.audio!
-                if audio.isRunning {
-                    // Warm engine: pre-roll is available → zero-latency, short clips work.
-                    audio.beginCapture()
-                } else {
-                    // Cold start (first press after idle sleep): spin the engine up,
-                    // then begin. This one press may clip a very short utterance.
-                    let deviceUID = self.configStore.config.microphone
-                    Task.detached {
-                        do { try audio.startEngine(deviceUID: deviceUID) }
-                        catch { fputs("[murmur] audio.startEngine failed: \(error)\n", stderr) }
-                        await MainActor.run { audio.beginCapture() }
-                    }
+                do {
+                    try await self.prepareAudioForCapture()
+                } catch let error as MicrophoneFailure {
+                    self.showMicrophoneFailureAlert(error)
+                    return
+                } catch {
+                    self.showMicrophoneFailureAlert(.startFailed(error.localizedDescription))
+                    return
                 }
+
+                // handleStart resets the recognizer buffer; beginCapture then flushes
+                // warm pre-roll into that fresh session.
+                self.ptt.handleStart()
+                guard self.ptt.isSessionActive else { return }
+
+                self.audio.beginCapture()
             }
         }
         keyboard.onPTTStop = { [weak self] in
@@ -186,6 +238,72 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             Task { @MainActor [weak self] in self?.ptt.handleAudioChunk(data) }
         }
         // Audio is started on PTT press and stopped on PTT release
+    }
+
+    private func prepareAudioForCapture() async throws {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            break
+        case .notDetermined:
+            let granted = await requestMicrophoneAccess()
+            guard granted else { throw MicrophoneFailure.permissionDenied }
+        case .denied:
+            throw MicrophoneFailure.permissionDenied
+        case .restricted:
+            throw MicrophoneFailure.permissionRestricted
+        @unknown default:
+            throw MicrophoneFailure.permissionDenied
+        }
+
+        guard !audio.isRunning else { return }
+
+        do {
+            try audio.startEngine(deviceUID: configStore.config.microphone)
+        } catch AudioCaptureError.noInputDevice {
+            throw MicrophoneFailure.noInputDevice
+        } catch AudioCaptureError.selectedDeviceUnavailable(_) {
+            throw MicrophoneFailure.selectedDeviceUnavailable
+        } catch {
+            fputs("[murmur] audio.startEngine failed: \(error)\n", stderr)
+            throw MicrophoneFailure.startFailed(error.localizedDescription)
+        }
+    }
+
+    private func requestMicrophoneAccess() async -> Bool {
+        await withCheckedContinuation { continuation in
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                continuation.resume(returning: granted)
+            }
+        }
+    }
+
+    private func showMicrophoneFailureAlert(_ failure: MicrophoneFailure) {
+        guard !microphoneAlertVisible else { return }
+        microphoneAlertVisible = true
+
+        let alert = NSAlert()
+        alert.messageText = failure.title
+        alert.informativeText = failure.message
+        alert.alertStyle = .warning
+
+        if failure.canOpenSettings {
+            alert.addButton(withTitle: L("alert.microphone.open_settings"))
+        }
+        alert.addButton(withTitle: L("common.cancel"))
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        microphoneAlertVisible = false
+
+        if failure.canOpenSettings, response == .alertFirstButtonReturn {
+            openMicrophoneSettings()
+        }
+    }
+
+    private func openMicrophoneSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: - Tray

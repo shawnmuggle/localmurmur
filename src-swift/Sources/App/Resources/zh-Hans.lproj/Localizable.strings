@@ -6,6 +6,18 @@
 "common.system_default" = "系统默认";
 "common.no_data" = "暂无数据";
 
+/* alerts */
+"alert.microphone.open_settings" = "打开系统设置";
+"alert.microphone.permission.title" = "需要开启麦克风权限";
+"alert.microphone.permission.message" = "Murmur 需要麦克风权限才能录音。请在「系统设置 → 隐私与安全性 → 麦克风」中开启。";
+"alert.microphone.restricted.message" = "这台 Mac 上的麦克风权限受限。请检查屏幕使用时间、设备管理或系统设置。";
+"alert.microphone.no_device.title" = "未找到麦克风";
+"alert.microphone.no_device.message" = "请连接麦克风，或在 Murmur 设置中选择可用的输入设备。";
+"alert.microphone.selected_unavailable.title" = "已选择的麦克风不可用";
+"alert.microphone.selected_unavailable.message" = "已选择的麦克风已断开或不可用。请重新连接，或在 Murmur 设置中选择「系统默认」。";
+"alert.microphone.start_failed.title" = "麦克风启动失败";
+"alert.microphone.start_failed.message" = "Murmur 无法开始录音。\n\n%@";
+
 /* menu */
 "menu.history" = "历史记录...";
 "menu.hotwords" = "热词库...";

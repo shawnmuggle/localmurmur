@@ -6,6 +6,18 @@
 "common.system_default" = "System Default";
 "common.no_data" = "No data";
 
+/* alerts */
+"alert.microphone.open_settings" = "Open Settings";
+"alert.microphone.permission.title" = "Microphone Access Needed";
+"alert.microphone.permission.message" = "Murmur needs microphone access to record. Turn it on in System Settings → Privacy & Security → Microphone.";
+"alert.microphone.restricted.message" = "Microphone access is restricted on this Mac. Check Screen Time, device management, or System Settings.";
+"alert.microphone.no_device.title" = "No Microphone Found";
+"alert.microphone.no_device.message" = "Connect a microphone or choose an available input device in Murmur Settings.";
+"alert.microphone.selected_unavailable.title" = "Selected Microphone Unavailable";
+"alert.microphone.selected_unavailable.message" = "The selected microphone is disconnected or unavailable. Reconnect it or choose System Default in Murmur Settings.";
+"alert.microphone.start_failed.title" = "Microphone Could Not Start";
+"alert.microphone.start_failed.message" = "Murmur could not start recording.\n\n%@";
+
 /* menu */
 "menu.history" = "History...";
 "menu.hotwords" = "Hot Words...";
